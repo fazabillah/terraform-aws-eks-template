@@ -1,4 +1,4 @@
-# devopsfaza EKS Terraform Template
+# Terraform AWS EKS Template
 
 A flat Terraform template that spins up a production-ready EKS cluster on AWS. No modules — everything is in `main.tf` so it's easy to read and modify.
 
