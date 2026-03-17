@@ -2,45 +2,34 @@ provider "aws" {
   region = "us-east-1"
 }
 
+# ── Networking ────────────────────────────────────────────────────────────────
+
 resource "aws_vpc" "devopsfaza_vpc" {
   cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Name = "devopsfaza-vpc"
-  }
+  tags = { Name = "devopsfaza-vpc" }
 }
 
 resource "aws_subnet" "devopsfaza_subnet" {
-  count = 2
+  count                   = 2
   vpc_id                  = aws_vpc.devopsfaza_vpc.id
   cidr_block              = cidrsubnet(aws_vpc.devopsfaza_vpc.cidr_block, 8, count.index)
   availability_zone       = element(["us-east-1a", "us-east-1b"], count.index)
   map_public_ip_on_launch = true
-
-  tags = {
-    Name = "devopsfaza-subnet-${count.index}"
-  }
+  tags = { Name = "devopsfaza-subnet-${count.index}" }
 }
 
 resource "aws_internet_gateway" "devopsfaza_igw" {
   vpc_id = aws_vpc.devopsfaza_vpc.id
-
-  tags = {
-    Name = "devopsfaza-igw"
-  }
+  tags   = { Name = "devopsfaza-igw" }
 }
 
 resource "aws_route_table" "devopsfaza_route_table" {
   vpc_id = aws_vpc.devopsfaza_vpc.id
-
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.devopsfaza_igw.id
   }
-
-  tags = {
-    Name = "devopsfaza-route-table"
-  }
+  tags = { Name = "devopsfaza-route-table" }
 }
 
 resource "aws_route_table_association" "devopsfaza_association" {
@@ -49,42 +38,48 @@ resource "aws_route_table_association" "devopsfaza_association" {
   route_table_id = aws_route_table.devopsfaza_route_table.id
 }
 
+# ── Security Groups ───────────────────────────────────────────────────────────
+
 resource "aws_security_group" "devopsfaza_cluster_sg" {
   vpc_id = aws_vpc.devopsfaza_vpc.id
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+  tags = { Name = "devopsfaza-cluster-sg" }
+}
 
-  tags = {
-    Name = "devopsfaza-cluster-sg"
-  }
+# Allow nodes to reach the API server (required for kubectl exec, webhooks, metrics)
+resource "aws_security_group_rule" "cluster_ingress_nodes_443" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.devopsfaza_node_sg.id
+  security_group_id        = aws_security_group.devopsfaza_cluster_sg.id
+  description              = "Allow inbound HTTPS from worker nodes"
 }
 
 resource "aws_security_group" "devopsfaza_node_sg" {
   vpc_id = aws_vpc.devopsfaza_vpc.id
-
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    Name = "devopsfaza-node-sg"
-  }
+  tags = { Name = "devopsfaza-node-sg" }
 }
+
+# ── EKS Cluster ───────────────────────────────────────────────────────────────
 
 resource "aws_eks_cluster" "devopsfaza" {
   name     = "devopsfaza-cluster"
@@ -96,15 +91,63 @@ resource "aws_eks_cluster" "devopsfaza" {
   }
 }
 
+# ── OIDC Provider (required for IRSA) ────────────────────────────────────────
+
+data "tls_certificate" "cluster" {
+  url = aws_eks_cluster.devopsfaza.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "cluster" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.cluster.certificates[0].sha1_fingerprint]
+  url             = aws_eks_cluster.devopsfaza.identity[0].oidc[0].issuer
+}
+
+# ── IAM Role for EBS CSI Driver (IRSA) ───────────────────────────────────────
+
+resource "aws_iam_role" "ebs_csi_driver_role" {
+  name = "devopsfaza-ebs-csi-driver-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.cluster.arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${replace(aws_iam_openid_connect_provider.cluster.url, "https://", "")}:sub" = "system:serviceaccount:kube-system:ebs-csi-controller-sa"
+          "${replace(aws_iam_openid_connect_provider.cluster.url, "https://", "")}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi_driver_policy" {
+  role       = aws_iam_role.ebs_csi_driver_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+# ── EBS CSI Driver Addon ──────────────────────────────────────────────────────
 
 resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name    = aws_eks_cluster.devopsfaza.name
-  addon_name      = "aws-ebs-csi-driver"
+  cluster_name             = aws_eks_cluster.devopsfaza.name
+  addon_name               = "aws-ebs-csi-driver"
+  service_account_role_arn = aws_iam_role.ebs_csi_driver_role.arn
 
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
+
+  depends_on = [
+    aws_iam_openid_connect_provider.cluster,
+    aws_iam_role_policy_attachment.ebs_csi_driver_policy,
+  ]
 }
 
+# ── Node Group ────────────────────────────────────────────────────────────────
 
 resource "aws_eks_node_group" "devopsfaza" {
   cluster_name    = aws_eks_cluster.devopsfaza.name
@@ -121,10 +164,12 @@ resource "aws_eks_node_group" "devopsfaza" {
   instance_types = ["t2.medium"]
 
   remote_access {
-    ec2_ssh_key = var.ssh_key_name
+    ec2_ssh_key               = var.ssh_key_name
     source_security_group_ids = [aws_security_group.devopsfaza_node_sg.id]
   }
 }
+
+# ── IAM Roles ─────────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "devopsfaza_cluster_role" {
   name = "devopsfaza-cluster-role"
@@ -135,9 +180,7 @@ resource "aws_iam_role" "devopsfaza_cluster_role" {
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": {
-        "Service": "eks.amazonaws.com"
-      },
+      "Principal": { "Service": "eks.amazonaws.com" },
       "Action": "sts:AssumeRole"
     }
   ]
@@ -159,9 +202,7 @@ resource "aws_iam_role" "devopsfaza_node_group_role" {
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": {
-        "Service": "ec2.amazonaws.com"
-      },
+      "Principal": { "Service": "ec2.amazonaws.com" },
       "Action": "sts:AssumeRole"
     }
   ]
